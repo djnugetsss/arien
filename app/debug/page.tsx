@@ -7,7 +7,7 @@ import { useMemo, useState } from "react";
 import { FAULT_TYPES, createSite, formatLocation, runFaultLog, type Fault, type FaultType } from "@/engine";
 
 const SEED = "arien-demo";
-const MAX_TICK = 1000;
+const MAX_TICK = 8640; // one sim day at 10-second ticks
 
 // Debug-only colors. Real colors go in the design-tokens file in phase 5.
 const COLORS: Record<FaultType | "ok", string> = {

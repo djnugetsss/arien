@@ -46,13 +46,13 @@ export interface FaultConfig {
 }
 
 export const DEFAULT_FAULT_CONFIG: FaultConfig = {
-  // ASSUMPTION: demo-tuned rates, not field data. They give roughly 27 faults per
-  // 1,000 ticks so the log is readable. Real sites fault far less often per minute.
+  // ASSUMPTION: demo-tuned rates, not field data. At 10-second ticks they give
+  // roughly 39 faults per sim day (8,640 ticks). Real sites fault far less often.
   perTickChance: {
-    hotspot: 0.012, // ASSUMPTION: most common fault in the demo
-    soiling: 0.008, // ASSUMPTION
-    string_outage: 0.004, // ASSUMPTION
-    tracker_stuck: 0.003, // ASSUMPTION: rarest in the demo
+    hotspot: 0.002, // ASSUMPTION: most common fault in the demo, about 0.7 per hour
+    soiling: 0.0013, // ASSUMPTION: about 0.5 per hour
+    string_outage: 0.0007, // ASSUMPTION: about 0.25 per hour
+    tracker_stuck: 0.0005, // ASSUMPTION: rarest in the demo, about 0.2 per hour
   },
   // ASSUMPTION: severity mixes are guesses. Hotspots and soiling skew minor,
   // string outages and stuck trackers skew serious because they hit more panels.
@@ -186,7 +186,7 @@ export function formatFault(fault: Fault, clock: Clock = createClock()): string 
   const time = formatSimTime(advance({ ...clock, tick: 0 }, fault.startTick));
   return [
     time,
-    `tick=${String(fault.startTick).padStart(4, "0")}`,
+    `tick=${String(fault.startTick).padStart(5, "0")}`,
     fault.id,
     fault.type.padEnd(13),
     `sev=${fault.severity}`,

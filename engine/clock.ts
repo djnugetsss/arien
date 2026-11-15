@@ -8,7 +8,7 @@ export interface Clock {
   tickSeconds: number;
 }
 
-export const DEFAULT_TICK_SECONDS = 60; // ASSUMPTION: 1 tick = 1 sim minute; tune once worker speeds exist
+export const DEFAULT_TICK_SECONDS = 10; // ASSUMPTION: 1 tick = 10 sim seconds, short enough that travel across the site takes several ticks
 
 export function createClock(tickSeconds: number = DEFAULT_TICK_SECONDS): Clock {
   if (!(tickSeconds > 0)) throw new Error(`tickSeconds must be > 0, got ${tickSeconds}`);
@@ -24,11 +24,21 @@ export function elapsedSeconds(clock: Clock): number {
   return clock.tick * clock.tickSeconds;
 }
 
-/** Sim time as "D+HH:MM", e.g. tick 1500 at 60s/tick -> "1+01:00". */
+/** Sim time as "D+HH:MM", e.g. 1,500 one-minute ticks -> "1+01:00". */
 export function formatSimTime(clock: Clock): string {
   const totalMinutes = Math.floor(elapsedSeconds(clock) / 60);
   const days = Math.floor(totalMinutes / 1440);
   const hh = String(Math.floor((totalMinutes % 1440) / 60)).padStart(2, "0");
   const mm = String(totalMinutes % 60).padStart(2, "0");
   return `${days}+${hh}:${mm}`;
+}
+
+/** Time of day as "HH:MM" for a given tick. */
+export function formatTimeOfDay(clock: Clock, tick: number = clock.tick): string {
+  return formatSimTime({ ...clock, tick }).split("+")[1];
+}
+
+/** Whole ticks needed to cover `seconds` (rounded up). */
+export function ticksFor(clock: Clock, seconds: number): number {
+  return Math.ceil(seconds / clock.tickSeconds);
 }

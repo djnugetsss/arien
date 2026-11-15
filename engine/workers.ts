@@ -12,7 +12,7 @@ export interface Point {
   y: number;
 }
 
-export const SKILLS = ["inspect", "verify", "repair", "replace"] as const;
+export const SKILLS = ["inspect", "verify", "repair", "replace", "recover"] as const;
 export type Skill = (typeof SKILLS)[number];
 
 /** A label for people to read. The engine does not branch on it. */
@@ -50,6 +50,8 @@ export interface Worker {
   travel: TravelMode;
   speedMps: number;
   skills: readonly Skill[];
+  /** A person. People always get a conclusive result when they verify a fault. */
+  human: boolean;
   /** null = available around the clock. */
   shift: Shift | null;
   /** null = no battery limit modeled. */
@@ -68,6 +70,7 @@ export interface WorkerSpec {
   travel: TravelMode;
   speedMps: number;
   skills: readonly Skill[];
+  human?: boolean;
   shift?: Shift | null;
   /** Starts fully charged. */
   battery?: { capacityS: number; rechargeS: number } | null;
@@ -100,6 +103,7 @@ export function createWorker(spec: WorkerSpec): Worker {
     travel: spec.travel,
     speedMps: spec.speedMps,
     skills: [...spec.skills],
+    human: spec.human ?? false,
     shift,
     battery: spec.battery ? { ...spec.battery, chargeS: spec.battery.capacityS } : null,
     home: { ...home },
@@ -149,7 +153,8 @@ export function createTechnician(id: string, overrides: Overrides = {}): Worker 
     type: "technician",
     travel: "ground",
     speedMps: 1.4, // ASSUMPTION: normal walking pace
-    skills: ["verify", "repair", "replace"],
+    skills: ["verify", "repair", "replace", "recover"], // recover = fetch a stranded drone or robot
+    human: true,
     shift: { startHour: 8, endHour: 16 }, // ASSUMPTION: one 8-hour day shift
     battery: null,
     ...overrides,
@@ -209,6 +214,14 @@ export function shiftSecondsLeft(shift: Shift | null, clock: Clock): number {
   // Runs past midnight.
   if (now >= start) return DAY_S - now + end;
   return now < end ? end - now : 0;
+}
+
+/** Seconds until the next shift starts. 0 when on shift or when there is no shift. */
+export function secondsUntilShiftStart(shift: Shift | null, clock: Clock): number {
+  if (!shift || shiftSecondsLeft(shift, clock) > 0) return 0;
+  const now = elapsedSeconds(clock) % DAY_S;
+  const start = shift.startHour * 3600;
+  return start > now ? start - now : DAY_S - now + start;
 }
 
 // ---------- questions the dispatcher will ask ----------
@@ -278,6 +291,10 @@ export function stepWorker(worker: Worker, clock: Clock): Worker {
 
   // A battery can run out partway through a tick.
   const battery = worker.battery;
+  // Flat at home: it cannot take off. It charges this tick and keeps its target for later.
+  const grounded = battery !== null && battery.chargeS <= 0 && startedAtHome;
+  const heldTarget = grounded ? target : null;
+  if (grounded) target = null;
   const active = target !== null || !startedAtHome;
   const usableS = battery && active ? Math.min(dt, battery.chargeS) : dt;
 
@@ -302,8 +319,12 @@ export function stepWorker(worker: Worker, clock: Clock): Worker {
     }
   }
 
+  if (grounded) target = heldTarget;
+
   let status: WorkerStatus;
-  if (nextBattery && nextBattery.chargeS <= 0 && !atHome) {
+  if (grounded && !offShift) {
+    status = "charging";
+  } else if (nextBattery && nextBattery.chargeS <= 0 && !atHome) {
     status = "stranded";
     target = null;
   } else if (offShift) {

@@ -15,57 +15,56 @@ const site = createSite();
 const log = (faults: Fault[]) => faults.map((f) => formatFault(f)).join("\n");
 
 describe("fault generator: determinism", () => {
-  it("same seed gives identical faults over 1,000 ticks", () => {
-    const a = runFaultLog({ seed: "arien-demo", ticks: 1000 });
-    const b = runFaultLog({ seed: "arien-demo", ticks: 1000 });
+  it("same seed gives identical faults over one sim day", () => {
+    const a = runFaultLog({ seed: "arien-demo", ticks: 8640 });
+    const b = runFaultLog({ seed: "arien-demo", ticks: 8640 });
     expect(a.length).toBeGreaterThan(0);
     expect(a).toEqual(b);
   });
 
   it("same seed gives a byte-identical printed log", () => {
-    expect(log(runFaultLog({ seed: 42, ticks: 1000 }))).toBe(log(runFaultLog({ seed: 42, ticks: 1000 })));
+    expect(log(runFaultLog({ seed: 42, ticks: 8640 }))).toBe(log(runFaultLog({ seed: 42, ticks: 8640 })));
   });
 
   it("different seeds give different logs", () => {
-    expect(log(runFaultLog({ seed: 1, ticks: 1000 }))).not.toBe(log(runFaultLog({ seed: 2, ticks: 1000 })));
+    expect(log(runFaultLog({ seed: 1, ticks: 8640 }))).not.toBe(log(runFaultLog({ seed: 2, ticks: 8640 })));
   });
 
   it("holds across many seeds", () => {
     for (let seed = 0; seed < 50; seed++) {
-      expect(runFaultLog({ seed, ticks: 500 })).toEqual(runFaultLog({ seed, ticks: 500 }));
+      expect(runFaultLog({ seed, ticks: 3000 })).toEqual(runFaultLog({ seed, ticks: 3000 }));
     }
   });
 
   it("a longer run starts with the exact same faults as a shorter one", () => {
-    const short = runFaultLog({ seed: 7, ticks: 400 });
-    const long = runFaultLog({ seed: 7, ticks: 1000 });
+    const short = runFaultLog({ seed: 7, ticks: 4000 });
+    const long = runFaultLog({ seed: 7, ticks: 8640 });
+    expect(short.length).toBeGreaterThan(0);
     expect(long.slice(0, short.length)).toEqual(short);
   });
 
   it("stepping tick by tick matches runFaultLog", () => {
     const generator = createFaultGenerator(site, createRng(7));
     const stepped: Fault[] = [];
-    for (let tick = 1; tick <= 1000; tick++) stepped.push(...generator.step(tick));
-    expect(stepped).toEqual(runFaultLog({ seed: 7, ticks: 1000 }));
+    for (let tick = 1; tick <= 8640; tick++) stepped.push(...generator.step(tick));
+    expect(stepped).toEqual(runFaultLog({ seed: 7, ticks: 8640 }));
   });
 
   it("log for seed 42 is pinned, so a change to rates or draw order fails loudly", () => {
-    expect(log(runFaultLog({ seed: 42, ticks: 300 }))).toMatchInlineSnapshot(`
-      "0+00:05  tick=0005  F0001  string_outage  sev=2  R10-P21..P40
-      0+01:03  tick=0063  F0002  hotspot        sev=1  R03-P38
-      0+01:59  tick=0119  F0003  hotspot        sev=2  R14-P08
-      0+02:23  tick=0143  F0004  hotspot        sev=4  R02-P04
-      0+02:23  tick=0143  F0005  soiling        sev=2  R01-P03..P10
-      0+02:23  tick=0143  F0006  tracker_stuck  sev=4  R09-P01..P40
-      0+02:42  tick=0162  F0007  hotspot        sev=2  R15-P16
-      0+03:13  tick=0193  F0008  tracker_stuck  sev=5  R17-P01..P40
-      0+04:14  tick=0254  F0009  hotspot        sev=2  R17-P32"
+    expect(log(runFaultLog({ seed: 42, ticks: 2000 }))).toMatchInlineSnapshot(`
+      "0+00:24  tick=00145  F0001  soiling        sev=1  R02-P37..P39
+      0+00:33  tick=00198  F0002  hotspot        sev=4  R17-P37
+      0+01:44  tick=00626  F0003  hotspot        sev=4  R02-P26
+      0+03:21  tick=01208  F0004  hotspot        sev=2  R13-P25
+      0+03:24  tick=01224  F0005  hotspot        sev=3  R05-P03
+      0+04:04  tick=01469  F0006  hotspot        sev=2  R08-P37
+      0+05:28  tick=01973  F0007  hotspot        sev=3  R19-P16"
     `);
   });
 });
 
 describe("fault generator: fault shape", () => {
-  const faults = runFaultLog({ seed: "shape-check", ticks: 20_000 });
+  const faults = runFaultLog({ seed: "shape-check", ticks: 200_000 });
 
   it("produces all four fault types", () => {
     expect(new Set(faults.map((f) => f.type))).toEqual(new Set(FAULT_TYPES));
@@ -75,7 +74,7 @@ describe("fault generator: fault shape", () => {
     for (const f of faults) {
       expect([1, 2, 3, 4, 5]).toContain(f.severity);
       expect(f.startTick).toBeGreaterThanOrEqual(1);
-      expect(f.startTick).toBeLessThanOrEqual(20_000);
+      expect(f.startTick).toBeLessThanOrEqual(200_000);
       const { row, colStart, colEnd, x, y } = f.location;
       expect(row).toBeGreaterThanOrEqual(0);
       expect(row).toBeLessThan(site.rows);
@@ -117,7 +116,7 @@ describe("fault generator: fault shape", () => {
 
   it("fault counts land near the configured rates", () => {
     for (const type of FAULT_TYPES) {
-      const expected = DEFAULT_FAULT_CONFIG.perTickChance[type] * 20_000;
+      const expected = DEFAULT_FAULT_CONFIG.perTickChance[type] * 200_000;
       const actual = faults.filter((f) => f.type === type).length;
       expect(actual).toBeGreaterThan(expected * 0.7);
       expect(actual).toBeLessThan(expected * 1.3);
@@ -157,6 +156,6 @@ describe("fault generator: config and formatting", () => {
     expect(formatLocation({ row: 6, colStart: 11, colEnd: 11, x: 0, y: 0 })).toBe("R07-P12");
     expect(formatLocation({ row: 6, colStart: 11, colEnd: 19, x: 0, y: 0 })).toBe("R07-P12..P20");
     const line = formatFault({ id: "F0003", type: "hotspot", severity: 3, startTick: 192, location: { row: 6, colStart: 11, colEnd: 11, x: 0, y: 0 } });
-    expect(line).toBe("0+03:12  tick=0192  F0003  hotspot        sev=3  R07-P12");
+    expect(line).toBe("0+00:32  tick=00192  F0003  hotspot        sev=3  R07-P12");
   });
 });

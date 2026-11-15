@@ -2,13 +2,17 @@
 //
 //   detected -> inspect -> verify -> repair  -> done
 //                                 \-> replace -> done
+//                                 \-> done (false alarm, only after a person verifies)
 //
 // State = the step the task is on. "detected" means nobody has picked it up yet.
 // Within a step, `phase` says whether it is waiting for a worker, the worker is
 // traveling there, or the worker is on site working.
+//
+// A second kind of task, "recover", fetches a stranded worker. It is a single
+// step: it starts in "repair" and ends in "done".
 
-import type { Fault, FaultType } from "./faults";
-import type { Point, Skill } from "./workers";
+import type { Fault, FaultType, Severity } from "./faults";
+import type { Point, Skill, Worker } from "./workers";
 
 export const TASK_STATES = ["detected", "inspect", "verify", "repair", "replace", "done"] as const;
 export type TaskState = (typeof TASK_STATES)[number];
@@ -17,7 +21,7 @@ export type TaskState = (typeof TASK_STATES)[number];
 export const NEXT_STATES: Record<TaskState, readonly TaskState[]> = {
   detected: ["inspect"],
   inspect: ["verify"],
-  verify: ["repair", "replace"],
+  verify: ["repair", "replace", "done"],
   repair: ["done"],
   replace: ["done"],
   done: [],
@@ -26,7 +30,7 @@ export const NEXT_STATES: Record<TaskState, readonly TaskState[]> = {
 export type WorkStep = "inspect" | "verify" | "repair" | "replace";
 export type OpenState = Exclude<TaskState, "done">;
 
-/** Skill a worker needs to take the task in each state. */
+/** Skill a worker needs to take a fault task in each state. */
 export const STATE_SKILL: Record<OpenState, Skill> = {
   detected: "inspect",
   inspect: "inspect",
@@ -35,20 +39,71 @@ export const STATE_SKILL: Record<OpenState, Skill> = {
   replace: "replace",
 };
 
+export type TaskKind = "fault" | "recover";
 export type TaskPhase = "waiting" | "traveling" | "working";
+export type Resolution = "repaired" | "replaced" | "false_alarm" | "recovered" | "taken_over";
+
+/** pickup: detection -> inspector. confirm: inspector -> verifier. fix: verifier -> repairer. */
+export type HandoffKind = "pickup" | "confirm" | "fix" | "recover";
+
+/** The current step's handoff: who needs to take it, by when, and how it is going. */
+export interface Handoff {
+  kind: HandoffKind;
+  offeredTick: number;
+  /** A worker must accept by this tick, or the handoff times out. */
+  deadlineTick: number;
+  workerId: string | null;
+  acceptedTick: number | null;
+  /** The accepting worker must arrive by this tick, or the handoff is late. */
+  arriveByTick: number | null;
+  completedTick: number | null;
+  /** Dropped, late, or bounced so far on this step. Two means the retry failed too. */
+  failCount: number;
+  timedOut: boolean;
+}
+
+/** Set by the sim when something goes wrong. The dispatcher decides whether to escalate. */
+export type TaskAlert = "timed_out" | "retry_failed" | "shift_cut";
 
 export interface Task {
-  /** "T0007" for fault "F0007". */
+  /** "T0007" for fault "F0007". "R0001" for a recovery job. */
   id: string;
-  fault: Fault;
+  kind: TaskKind;
+  /** Short name for logs: the fault type, or "recover D1". */
+  label: string;
+  severity: Severity;
+  /** null for recovery jobs. */
+  fault: Fault | null;
+  /** The stranded worker a recovery job fetches. */
+  recoverWorkerId: string | null;
   state: TaskState;
   phase: TaskPhase;
   workerId: string | null;
   /** Work seconds left in the current step. Only meaningful while working. */
   workLeftS: number;
-  /** Decided when the fault appears, revealed at verify. Keeps outcomes independent of dispatch. */
+  // Outcomes are decided when the fault appears, so they never depend on the dispatcher.
+  /** Revealed at verify: the part must be replaced, not repaired. */
   needsReplace: boolean;
-  /** Where workers go: the center of the fault's span. */
+  /** false = a robot's verify comes back "unconfirmed" and a person has to check. */
+  robotCanConfirm: boolean;
+  /** Only possible when the robot cannot confirm: a person finds nothing wrong. */
+  falseAlarm: boolean;
+  /** Workers who failed the current step on this task. They are not offered it again. */
+  failedWorkerIds: readonly string[];
+  /** A worker dropped the current step partway. Worth extra priority. */
+  interrupted: boolean;
+  resolution: Resolution | null;
+  handoff: Handoff | null;
+  alert: TaskAlert | null;
+  /** The open escalation covering this task, if any. */
+  escalationId: string | null;
+  /** A person said "wait until then". No new escalation before this tick. */
+  snoozeUntilTick: number;
+  /** A person picked this worker. The sim assigns them as soon as they are free. */
+  forcedWorkerId: string | null;
+  /** Last hold reason logged, so the same hold is not logged every tick. */
+  holdKey: string | null;
+  /** Where workers go: the center of the fault's span, or the stranded worker. */
   target: Point;
   createdTick: number;
   doneTick: number | null;
@@ -59,6 +114,14 @@ export interface TaskConfig {
   workSeconds: Record<WorkStep, Record<FaultType, number>>;
   /** Chance that verification finds the part must be replaced, not repaired. */
   replaceChance: Record<FaultType, number>;
+  /** Chance a robot's verify comes back "unconfirmed". */
+  unconfirmedChance: number;
+  /** Of the unconfirmed ones, the share a person finds to be a false alarm. */
+  falseAlarmChance: number;
+  /** On-site seconds to fetch a stranded worker. */
+  recoverSeconds: number;
+  /** Priority a recovery job is scored at. */
+  recoverSeverity: Severity;
 }
 
 const MIN = 60;
@@ -81,20 +144,71 @@ export const DEFAULT_TASK_CONFIG: TaskConfig = {
     string_outage: 0.15, // ASSUMPTION
     tracker_stuck: 0.1, // ASSUMPTION
   },
+  unconfirmedChance: 0.15, // ASSUMPTION: the robot cannot confirm about 1 fault in 7
+  falseAlarmChance: 0.3, // ASSUMPTION: 3 in 10 unconfirmed faults turn out to be nothing
+  recoverSeconds: 10 * MIN, // ASSUMPTION: 10 minutes on site to pick up a dead drone
+  recoverSeverity: 4, // ASSUMPTION: a stranded worker ranks like a serious fault
 };
 
-export function createTask(fault: Fault, needsReplace: boolean): Task {
+export interface FaultOutcomes {
+  needsReplace: boolean;
+  robotCanConfirm: boolean;
+  falseAlarm: boolean;
+}
+
+function blankTask(): Omit<Task, "id" | "kind" | "label" | "severity" | "fault" | "target" | "createdTick" | "state"> {
   return {
-    id: `T${fault.id.slice(1)}`,
-    fault,
-    state: "detected",
+    recoverWorkerId: null,
     phase: "waiting",
     workerId: null,
     workLeftS: 0,
-    needsReplace,
+    needsReplace: false,
+    robotCanConfirm: true,
+    falseAlarm: false,
+    failedWorkerIds: [],
+    interrupted: false,
+    resolution: null,
+    handoff: null,
+    alert: null,
+    escalationId: null,
+    snoozeUntilTick: 0,
+    forcedWorkerId: null,
+    holdKey: null,
+    doneTick: null,
+  };
+}
+
+export function createTask(fault: Fault, outcomes: Partial<FaultOutcomes> = {}): Task {
+  const robotCanConfirm = outcomes.robotCanConfirm ?? true;
+  return {
+    ...blankTask(),
+    id: `T${fault.id.slice(1)}`,
+    kind: "fault",
+    label: fault.type,
+    severity: fault.severity,
+    fault,
+    state: "detected",
+    needsReplace: outcomes.needsReplace ?? false,
+    robotCanConfirm,
+    falseAlarm: !robotCanConfirm && (outcomes.falseAlarm ?? false),
     target: { x: fault.location.x, y: fault.location.y },
     createdTick: fault.startTick,
-    doneTick: null,
+  };
+}
+
+/** A job to fetch a stranded worker from where it stopped. */
+export function createRecoverTask(seq: number, stranded: Worker, tick: number, config: TaskConfig = DEFAULT_TASK_CONFIG): Task {
+  return {
+    ...blankTask(),
+    id: `R${String(seq).padStart(4, "0")}`,
+    kind: "recover",
+    label: `recover ${stranded.id}`,
+    severity: config.recoverSeverity,
+    fault: null,
+    recoverWorkerId: stranded.id,
+    state: "repair",
+    target: { ...stranded.position },
+    createdTick: tick,
   };
 }
 
@@ -108,7 +222,7 @@ export function transition(task: Task, to: TaskState): Task {
   return { ...task, state: to };
 }
 
-/** Where the task goes when the current step's work finishes. */
+/** Where a fault task goes when the current step's work finishes normally. */
 export function stateAfterWork(task: Task): TaskState {
   switch (task.state) {
     case "inspect":
@@ -123,11 +237,33 @@ export function stateAfterWork(task: Task): TaskState {
   }
 }
 
+/** The step a worker would do if assigned now. A detected task's next step is inspect. */
+export function stepOf(task: Task): WorkStep | "recover" | null {
+  if (task.state === "done") return null;
+  if (task.kind === "recover") return "recover";
+  return task.state === "detected" ? "inspect" : task.state;
+}
+
+/** On-site seconds for the step a worker would do if assigned now. */
 export function workSecondsFor(task: Task, config: TaskConfig = DEFAULT_TASK_CONFIG): number {
-  if (task.state === "detected" || task.state === "done") throw new Error(`${task.id}: no work in state ${task.state}`);
-  return config.workSeconds[task.state][task.fault.type];
+  const step = stepOf(task);
+  if (step === null) throw new Error(`${task.id}: no work in state ${task.state}`);
+  if (step === "recover" || !task.fault) return config.recoverSeconds;
+  return config.workSeconds[step][task.fault.type];
 }
 
 export function skillFor(task: Task): Skill | null {
-  return task.state === "done" ? null : STATE_SKILL[task.state];
+  if (task.state === "done") return null;
+  return task.kind === "recover" ? "recover" : STATE_SKILL[task.state];
+}
+
+export function handoffKindFor(task: Task): HandoffKind {
+  if (task.kind === "recover") return "recover";
+  if (task.state === "verify") return "confirm";
+  return task.state === "repair" || task.state === "replace" ? "fix" : "pickup";
+}
+
+/** Waiting for a worker, and not reserved for one a person picked. */
+export function isWaiting(task: Task): boolean {
+  return task.state !== "done" && task.workerId === null;
 }

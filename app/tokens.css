@@ -1,0 +1,162 @@
+/*
+ * Arien design tokens. The single source for color, type, spacing, radii and motion.
+ * Proposed in docs/design-notes.md. Not imported yet: phase 5 adds
+ *   @import "./tokens.css";
+ * to globals.css (after `@import "tailwindcss";`).
+ *
+ * Rule: components use these tokens (via Tailwind utilities or var(--…)), never raw values.
+ * Color means something: chrome is monochrome; color is reserved for severity,
+ * worker type, and the human (sun).
+ */
+
+@theme {
+  /* Reset Tailwind's default palette so only Arien colors exist. */
+  --color-*: initial;
+
+  /* ---- Base & surfaces ---- */
+  --color-ink: #07090c; /* page background */
+  --color-surface-1: #0e1116; /* panels */
+  --color-surface-2: #151a21; /* raised: cards, rows on hover */
+  --color-surface-3: #1d232c; /* popovers, selected */
+
+  /* ---- Foreground: one white, stepped by opacity ---- */
+  --color-fg: #eceef2; /* 17.2:1 on ink */
+  --color-fg-muted: #9aa3ae; /* 7.8:1 on ink */
+  --color-fg-faint: #646d78; /* 3.8:1, decorative/non-essential only */
+  --color-line: rgb(236 238 242 / 0.08);
+  --color-line-strong: rgb(236 238 242 / 0.16);
+  --color-veil: rgb(7 9 12 / 0.72); /* overlay behind modals */
+
+  /* ---- Accent: sun = "a human should look at this" ---- */
+  --color-sun: #f2b84b;
+  --color-sun-dim: rgb(242 184 75 / 0.16);
+  --color-on-sun: #07090c;
+
+  /* ---- Fault severity ---- */
+  --color-critical: #ff5a5f;
+  --color-critical-dim: rgb(255 90 95 / 0.16);
+  --color-major: #ff7a45;
+  --color-major-dim: rgb(255 122 69 / 0.16);
+  --color-minor: #8fa3bf;
+  --color-minor-dim: rgb(143 163 191 / 0.16);
+  --color-ok: #3ddc97;
+  --color-ok-dim: rgb(61 220 151 / 0.16);
+
+  /* ---- Worker types ---- */
+  --color-drone: #5cc8ff;
+  --color-robot: #b69cff;
+  --color-tech: var(--color-sun);
+
+  /* ---- Site map ---- */
+  --color-panel: #1a2230; /* healthy panel tile */
+  --color-panel-edge: #232d3d;
+
+  /* ---- Type ---- */
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  --text-2xs: 0.75rem; /* 12 mono labels, axis ticks */
+  --text-2xs--line-height: 1rem;
+  --text-xs: 0.8125rem; /* 13 table rows, log lines */
+  --text-xs--line-height: 1.125rem;
+  --text-sm: 0.875rem; /* 14 default dashboard text */
+  --text-sm--line-height: 1.25rem;
+  --text-base: 1rem; /* 16 */
+  --text-base--line-height: 1.5rem;
+  --text-lg: 1.25rem; /* 20 */
+  --text-lg--line-height: 1.75rem;
+  --text-xl: 1.5rem; /* 24 panel titles */
+  --text-xl--line-height: 2rem;
+  --text-2xl: 2rem; /* 32 */
+  --text-2xl--line-height: 2.375rem;
+  --text-metric: 3rem; /* 48 metrics strip */
+  --text-metric--line-height: 1;
+  --text-display-sm: 4.5rem; /* 72 landing section heads */
+  --text-display-sm--line-height: 1;
+  --text-display: 7rem; /* 112 landing hero (mobile caps lower via clamp in component) */
+  --text-display--line-height: 0.95;
+  --text-display-xl: 10rem; /* 160 the one big comparison number */
+  --text-display-xl--line-height: 0.9;
+
+  --tracking-label: 0.06em; /* small mono / uppercase labels */
+  --tracking-normal: 0em;
+  --tracking-snug: -0.01em; /* 20–32 */
+  --tracking-tight: -0.02em; /* 48–72 */
+  --tracking-display: -0.04em; /* 112+ */
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  /* ---- Spacing (4px base; Tailwind multiplies this: p-4 = 16px) ---- */
+  --spacing: 0.25rem;
+
+  /* ---- Radii ---- */
+  --radius-xs: 2px;
+  --radius-sm: 4px; /* default: buttons, inputs, chips */
+  --radius-md: 6px; /* cards, panels */
+  --radius-lg: 10px; /* modals */
+  --radius-full: 9999px;
+
+  /* ---- Breakpoints ---- */
+  --breakpoint-sm: 40rem;
+  --breakpoint-md: 48rem;
+  --breakpoint-lg: 64rem;
+  --breakpoint-xl: 90rem;
+
+  /* ---- Easing ---- */
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1); /* UI responses */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1); /* entrances */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1); /* panels sliding */
+  --ease-linear: linear; /* sim movement between ticks */
+
+  /* ---- Animations ---- */
+  --animate-blink: blink 1.2s steps(1, end) infinite; /* the one "live" indicator */
+  --animate-rise: rise var(--duration-entrance) var(--ease-out-expo) both;
+
+  @keyframes blink {
+    0%, 60% { opacity: 1; }
+    61%, 100% { opacity: 0.15; }
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
+/* Tokens that aren't Tailwind theme namespaces. */
+:root {
+  --duration-hover: 120ms;
+  --duration-ui: 200ms;
+  --duration-panel: 400ms;
+  --duration-entrance: 750ms;
+  --stagger-step: 40ms; /* list items: delay = index * step */
+
+  --layout-columns: 12;
+  --layout-gutter: 1.5rem;
+  --layout-max: 90rem; /* 1440 */
+  --layout-pad: 1rem;
+  --section-gap: 6rem; /* 96 mobile */
+
+  --map-tile-gap: 1px; /* gap between panel tiles on the site map */
+  --focus-ring: 0 0 0 2px var(--color-ink), 0 0 0 4px var(--color-sun);
+
+  color-scheme: dark;
+}
+
+@media (min-width: 64rem) {
+  :root {
+    --layout-pad: 2rem;
+    --section-gap: 10rem; /* 160 desktop */
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-hover: 0ms;
+    --duration-ui: 0ms;
+    --duration-panel: 0ms;
+    --duration-entrance: 0ms;
+    --stagger-step: 0ms;
+  }
+}
