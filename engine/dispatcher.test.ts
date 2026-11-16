@@ -538,8 +538,8 @@ describe("failure case d: handoff times out", () => {
     expect(task(sim, id).workerId).toBe("T1");
   });
 
-  it("a failed retry escalates", () => {
-    const sim = quietSim(10, { autoHuman: false });
+  it("a failed retry escalates, even when a third worker is free to take it", () => {
+    const sim = quietSim(10, { autoHuman: false, crew: [createDrone("D1"), createGroundRobot("G1"), createTechnician("T1"), createTechnician("T2")] });
     const id = place(sim, FAR);
     until(sim, () => task(sim, id).workerId === "G1" && task(sim, id).phase === "traveling");
     setWorker(sim, "G1", { speedMps: 0.001 });
@@ -736,8 +736,10 @@ describe("escalation noise: when a stuck task is raised again", () => {
   /** What the task looked like when it was last raised: a few minutes before 10:00 by default. */
   const was = (extra: Partial<EscalatedState> = {}): EscalatedState => ({ step: "repair", severity: 3, disruptions: 0, blockerRank: 0, tick: 9.9 * TICKS_PER_HOUR, ...extra });
 
+  // T1 is tied up on another job, so nothing here gets a worker on this tick.
+  const tiedUp = () => repair("9999", 1, { workerId: "T1", phase: "working" });
   const raised = (clock: ReturnType<typeof at>, tasks: Task[], workers = dayShift()) =>
-    arienDispatcher({ clock, tasks, workers, busy: new Set(), coord, taskConfig: DEFAULT_TASK_CONFIG }).filter(
+    arienDispatcher({ clock, tasks: [tiedUp(), ...tasks], workers, busy: new Set(["T1"]), coord, taskConfig: DEFAULT_TASK_CONFIG }).filter(
       (d): d is Extract<DispatchDecision, { kind: "escalate" }> => d.kind === "escalate" && d.level !== "notice",
     );
 
@@ -924,6 +926,152 @@ describe("escalation noise: whole sim", () => {
     expect(changed.length).toBeGreaterThan(0);
     expect(new Set(changed.map((e) => e.openedTick)).size).toBe(changed.length); // never two at the same tick
     expect(Math.max(...changed.map((e) => e.taskIds.length))).toBeGreaterThan(3);
+  });
+});
+
+// ---------- 5c. bugs found in review ----------
+
+describe("review fixes", () => {
+  const coord = DEFAULT_COORDINATION_CONFIG;
+  const decideWith = (hour: number, tasks: Task[], workers: Worker[]) =>
+    arienDispatcher({ clock: advance(createClock(), Math.round(hour * TICKS_PER_HOUR)), tasks, workers, busy: new Set(), coord, taskConfig: DEFAULT_TASK_CONFIG });
+  const inState = (id: string, state: Task["state"], severity: Severity, extra: Partial<Task> = {}): Task => ({
+    ...createTask({ id: `F${id}`, type: "hotspot", severity, startTick: 0, location: { row: 2, colStart: 2, colEnd: 2, x: 2.2, y: 12 } }),
+    state,
+    ...extra,
+  });
+
+  describe("nobody left who can do the step", () => {
+    it("robot cannot confirm and the crew has no person: escalates at once, not after the deadline", () => {
+      const sim = quietSim(10, { crew: [createDrone("D1"), createGroundRobot("G1")], autoHuman: false });
+      const id = place(sim, { severity: 4 }, { robotCanConfirm: false });
+      until(sim, () => task(sim, id).failedWorkerIds.includes("G1"));
+      const bouncedAt = sim.clock.tick;
+      run(sim, 1);
+      const esc = sim.escalations.find((e) => e.taskIds.includes(id))!;
+      expect(esc).toMatchObject({ rule: "ESCALATE_NOBODY_LEFT", level: "needs_decision", openedTick: bouncedAt + 1 });
+      expect(esc.headline).toBe("Sev 4 hotspot at R06-P11 needs verify, and everyone who can do it has already failed");
+      expect(esc.why).toBe("G1 already failed verify on this task, and nobody else in the crew can verify. It will not move without a person.");
+      expect(whys(sim, id, "hold").at(-1)).toMatchObject({ rule: "HOLD_NO_CAPABLE_WORKER" });
+    });
+
+    it("two robots: both fail, the retry is used up, and it is raised as nobody left", () => {
+      const sim = quietSim(10, { crew: [createDrone("D1"), createGroundRobot("G1"), createGroundRobot("G2")], autoHuman: false });
+      const id = place(sim, {}, { robotCanConfirm: false });
+      until(sim, () => task(sim, id).failedWorkerIds.length === 2);
+      run(sim, 1);
+      expect(events(sim, "handoff_failed", id).map((e) => e.reason)).toEqual(["bounced", "bounced"]);
+      expect(sim.escalations.filter((e) => e.taskIds.includes(id)).map((e) => e.rule)).toEqual(["ESCALATE_NOBODY_LEFT"]);
+    });
+
+    it("a person can still send a worker back with reassign", () => {
+      const sim = quietSim(10, { crew: [createDrone("D1"), createGroundRobot("G1")], autoHuman: false });
+      const id = place(sim, {}, { robotCanConfirm: false });
+      until(sim, () => sim.escalations.some((e) => e.taskIds.includes(id)));
+      applyHumanAction(sim, { escalationId: sim.escalations[0].id, action: "reassign", workerId: "G1" });
+      until(sim, () => task(sim, id).workerId === "G1");
+      expect(whys(sim, id, "override")[0].rule).toBe("OVERRIDE_REASSIGN");
+    });
+
+    it("is not raised while someone who has not failed is merely busy or off shift", () => {
+      const sim = quietSim(1, { autoHuman: false }); // night: T1 can verify but is off shift
+      const id = place(sim, { severity: 1 }, { robotCanConfirm: false });
+      until(sim, () => task(sim, id).failedWorkerIds.includes("G1"));
+      run(sim, 20);
+      expect(sim.escalations.filter((e) => e.taskIds.includes(id))).toHaveLength(0);
+    });
+  });
+
+  describe("shift fit is counted in whole ticks", () => {
+    // A 45 min 5 s repair is not a whole number of 10-second ticks. Counted in raw seconds,
+    // some start times let the technician begin a job that ended one tick after 16:00.
+    const oddRepair = { workSeconds: { ...DEFAULT_TASK_CONFIG.workSeconds, repair: { ...DEFAULT_TASK_CONFIG.workSeconds.repair, hotspot: 2705 } } };
+
+    it("Arien never starts a repair that the shift end cuts off, for any start time or distance", () => {
+      let started = 0;
+      for (let startTick = 16 * TICKS_PER_HOUR - 300; startTick < 16 * TICKS_PER_HOUR - 255; startTick++) {
+        for (const col of [0, 3, 7, 13, 33]) {
+          const sim = createSim({ seed: 1, faultConfig: NO_FAULTS, taskConfig: oddRepair, clock: advance(createClock(), startTick) });
+          const id = place(sim, { col }, { needsReplace: false });
+          sim.tasks = sim.tasks.map((t) => (t.id === id ? { ...t, state: "repair", handoff: { ...t.handoff!, kind: "fix" } } : t));
+          run(sim, 320);
+          expect(events(sim, "released"), `start tick ${startTick}, column ${col}`).toHaveLength(0);
+          if (task(sim, id).state === "done") started += 1;
+        }
+      }
+      expect(started).toBeGreaterThan(20); // and it does still start the ones that fit
+    });
+
+    it("the reason shows the rounded-up job time", () => {
+      const sim = quietSim(15.5, { taskConfig: oddRepair });
+      const id = place(sim, {}, { needsReplace: false });
+      sim.tasks = sim.tasks.map((t) => (t.id === id ? { ...t, state: "repair" } : t));
+      run(sim, 1);
+      expect(whys(sim, id, "hold")[0].why).toMatch(/T1: shift ends in 30 min, job needs 46 min/);
+    });
+  });
+
+  describe("no escalation for a task that gets its worker on the same tick", () => {
+    it("a timed-out task with a free worker is assigned, not raised", () => {
+      const decisions = decideWith(10, [inState("0001", "repair", 5, { alert: "timed_out" })], [createTechnician("T1")]);
+      expect(decisions.map((d) => d.kind)).toEqual(["assign"]);
+    });
+
+    it("a failed retry is raised even though a worker takes it on the same tick", () => {
+      const decisions = decideWith(10, [inState("0001", "repair", 3, { alert: "retry_failed" })], [createTechnician("T1")]);
+      expect(decisions.map((d) => (d.kind === "escalate" ? d.rule : d.kind))).toEqual(["assign", "ESCALATE_RETRY_FAILED"]);
+    });
+
+    it("the same task with nobody free is raised", () => {
+      const busyTech = inState("0002", "repair", 3, { workerId: "T1", phase: "working" });
+      const decisions = arienDispatcher({
+        clock: advance(createClock(), 10 * TICKS_PER_HOUR),
+        tasks: [busyTech, inState("0001", "repair", 5, { alert: "timed_out" })],
+        workers: [createTechnician("T1")],
+        busy: new Set(["T1"]),
+        coord,
+        taskConfig: DEFAULT_TASK_CONFIG,
+      });
+      expect(decisions.map((d) => d.kind)).toEqual(["hold", "escalate"]);
+    });
+
+    it("a severity-5 notice is still sent for a fault assigned on the tick it appears", () => {
+      const sim = quietSim(10);
+      const id = place(sim, { severity: 5 });
+      run(sim, 1);
+      expect(task(sim, id).workerId).toBe("D1");
+      expect(sim.escalations.map((e) => e.rule)).toEqual(["NOTICE_SEV5"]);
+    });
+  });
+
+  describe("a timeout is never hidden behind a leftover alert", () => {
+    it("a low-severity repair cut at shift end still raises its timeout", () => {
+      const sim = quietSim(17, { autoHuman: false });
+      const id = place(sim, { severity: 3 }, { needsReplace: false });
+      // As it would be just after a shift cut: waiting on repair, never escalated, alert left set.
+      sim.tasks = sim.tasks.map((t) => (t.id === id ? { ...t, state: "repair", alert: "shift_cut", interrupted: true, disruptions: 1, handoff: { ...t.handoff!, kind: "fix" } } : t));
+      run(sim, 30);
+      expect(sim.escalations).toHaveLength(0); // severity 3: the cut alone does not escalate
+      until(sim, () => sim.escalations.length > 0);
+      expect(task(sim, id).handoff!.timedOut).toBe(true);
+      expect(sim.escalations[0]).toMatchObject({ rule: "ESCALATE_NO_WORKER_ON_SHIFT", taskIds: [id] });
+    });
+
+    it("a failed retry is not replaced by the timeout", () => {
+      const sim = quietSim(1, { autoHuman: false });
+      const id = place(sim, { severity: 5 });
+      sim.tasks = sim.tasks.map((t) => (t.id === id ? { ...t, state: "repair", alert: "retry_failed", escalationId: "E9999", handoff: { ...t.handoff!, kind: "fix" } } : t));
+      run(sim, 16 * MIN);
+      expect(task(sim, id)).toMatchObject({ alert: "retry_failed" });
+      expect(task(sim, id).handoff!.timedOut).toBe(true);
+    });
+  });
+
+  describe("scoring", () => {
+    it("a fault placed for a future tick never scores negative wait", () => {
+      const future = createTask({ id: "F0001", type: "soiling", severity: 1, startTick: 500, location: { row: 0, colStart: 0, colEnd: 0, x: 0, y: 0 } });
+      expect(scoreTask(future, advance(createClock(), 100), coord)).toMatchObject({ wait: 0, total: 20 });
+    });
   });
 });
 

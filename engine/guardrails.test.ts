@@ -22,6 +22,9 @@ const FORBIDDEN: Array<[string, RegExp]> = [
   ["uses Math.random", /Math\.random\s*\(/],
   ["uses Date.now", /Date\.now\s*\(/],
   ["uses new Date()", /new\s+Date\s*\(/],
+  // These may return slightly different floats in different JS engines, which would
+  // break "same seed, same run" between Node tests and a browser.
+  ["uses an engine-dependent Math function", /Math\.(hypot|sin|cos|tan|asin|acos|atan|atan2|exp|expm1|log|log2|log10|log1p|pow|cbrt|sinh|cosh|tanh)\s*\(/],
 ];
 
 describe("engine guardrails", () => {

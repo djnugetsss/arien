@@ -38,7 +38,7 @@ const minutes = (seconds: number) => Math.max(1, Math.round(seconds / 60));
 export function scoreTask(task: Task, clock: Clock, coord: CoordinationConfig): Score {
   const ageMinutes = ((clock.tick - task.createdTick) * clock.tickSeconds) / 60;
   const severity = coord.severityPoints * task.severity;
-  const wait = Math.min(coord.waitCap, Math.floor(ageMinutes / coord.minutesPerWaitPoint));
+  const wait = Math.max(0, Math.min(coord.waitCap, Math.floor(ageMinutes / coord.minutesPerWaitPoint)));
   const type = task.fault ? coord.typeBonus[task.fault.type] : 0;
   const interrupted = task.interrupted ? coord.interruptedBonus : 0;
   return { total: severity + wait + type + interrupted, severity, wait, type, interrupted };
@@ -60,6 +60,16 @@ function byPriority(a: Scored, b: Scored): number {
 }
 
 // ---------- 2. worker choice ----------
+
+/**
+ * Seconds a job really takes in the sim: travel and work are each rounded up to whole
+ * ticks, because a worker arrives and finishes on tick boundaries. Using raw seconds
+ * here could start a job that finishes one tick after the shift ends, and lose it.
+ */
+function jobSeconds(travelS: number, workS: number, clock: Clock): number {
+  const dt = clock.tickSeconds;
+  return (Math.ceil(travelS / dt) + Math.ceil(workS / dt)) * dt;
+}
 
 interface Evaluated extends Candidate {
   worker: Worker;
@@ -108,10 +118,11 @@ function evaluate(worker: Worker, crewIndex: number, task: Task, round: Round): 
   }
   if (worker.shift) {
     const leftS = shiftSecondsLeft(worker.shift, ctx.clock);
-    if (leftS < travelS + workS) {
-      return reject("shift_short", `shift ends in ${minutes(leftS)} min, job needs ${minutes(travelS + workS)} min`);
+    const jobS = jobSeconds(travelS, workS, ctx.clock);
+    if (leftS < jobS) {
+      return reject("shift_short", `shift ends in ${minutes(leftS)} min, job needs ${minutes(jobS)} min`);
     }
-    slackS = Math.min(slackS, leftS - travelS - workS);
+    slackS = Math.min(slackS, leftS - jobS);
   }
 
   // Technician guard: a repair-capable worker only verifies when no repair job is waiting
@@ -126,8 +137,8 @@ function evaluate(worker: Worker, crewIndex: number, task: Task, round: Round): 
           const otherSkill = skillFor(other);
           if (other.id === task.id || (otherSkill !== "repair" && otherSkill !== "replace")) return false;
           if (!hasSkill(worker, otherSkill) || other.failedWorkerIds.includes(worker.id)) return false;
-          const needS = travelSeconds(worker, other.target) + workSecondsFor(other, ctx.taskConfig);
-          return shiftSecondsLeft(worker.shift, ctx.clock) >= needS;
+          const jobS = jobSeconds(travelSeconds(worker, other.target), workSecondsFor(other, ctx.taskConfig), ctx.clock);
+          return shiftSecondsLeft(worker.shift, ctx.clock) >= jobS;
         })
       : undefined;
     if (waitingFix) return reject("guard", `held for ${stepOf(waitingFix.task)} job ${waitingFix.task.id}`);
@@ -223,7 +234,9 @@ export function blockerOf(task: Task, ctx: DispatchContext): Blocker {
   const skill = skillFor(task);
   if (!skill || !ctx.workers.some((w) => hasSkill(w, skill))) return "no_skill";
   const capable = ctx.workers.filter((w) => hasSkill(w, skill) && !task.failedWorkerIds.includes(w.id));
-  return capable.length > 0 && capable.every((w) => !isOnShift(w.shift, ctx.clock)) ? "off_shift" : "capacity";
+  // Everyone with the skill has already failed this step here. Waiting will not help.
+  if (capable.length === 0) return "nobody_left";
+  return capable.every((w) => !isOnShift(w.shift, ctx.clock)) ? "off_shift" : "capacity";
 }
 
 interface Raise {
@@ -235,7 +248,7 @@ interface Raise {
   digestKey?: string;
 }
 
-function escalations(ctx: DispatchContext): DispatchDecision[] {
+function escalations(ctx: DispatchContext, assignedNow: ReadonlySet<string>): DispatchDecision[] {
   const { clock, coord } = ctx;
   const tick = clock.tick;
   const out: DispatchDecision[] = [];
@@ -261,6 +274,11 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
 
     // One open escalation per task: while it sits in the inbox there is nothing to add.
     if (!isWaiting(task) || task.escalationId !== null) continue;
+    // A task that got its worker this tick is no longer stuck, so "still waiting" raises
+    // (timeouts, changes, reminders) are dropped. A failed retry or a cut-off repair is
+    // still raised: the spec says those always reach a person.
+    const gotWorker = assignedNow.has(task.id);
+    if (gotWorker && task.alert !== "retry_failed" && task.alert !== "shift_cut") continue;
 
     const step = stepOf(task)!;
     const skill = skillFor(task)!;
@@ -278,7 +296,13 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
         changes.push(`${n} more failed handoff${n === 1 ? "" : "s"} on this step`);
       }
       if (rank > prev.blockerRank) {
-        changes.push(blocker === "off_shift" ? `every worker who can ${step} is now off shift` : `nobody in the crew can ${step}`);
+        changes.push(
+          blocker === "off_shift"
+            ? `every worker who can ${step} is now off shift`
+            : blocker === "nobody_left"
+              ? `every worker who can ${step} has now failed it`
+              : `nobody in the crew can ${step}`,
+        );
       }
     }
     const isNew = prev === null || changes.length > 0;
@@ -336,7 +360,10 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
     };
 
     let raise: Raise | null = null;
-    if (isNew) {
+    if (gotWorker) {
+      raise = isNew ? fromAlert() : null;
+    } else if (isNew) {
+      const failedHere = ctx.workers.filter((w) => hasSkill(w, skill) && task.failedWorkerIds.includes(w.id)).map((w) => w.id);
       raise =
         (blocker === "no_skill"
           ? {
@@ -345,7 +372,14 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
               why: `No worker in the crew has the ${skill} skill.`,
               suggested: { action: "ack" as const, label: "Take it over yourself, or add a worker with this skill" },
             }
-          : fromAlert()) ??
+          : blocker === "nobody_left"
+            ? {
+                rule: "ESCALATE_NOBODY_LEFT" as const,
+                headline: () => `${describe(task)} needs ${step}, and everyone who can do it has already failed`,
+                why: `${failedHere.join(" and ")} already failed ${step} on this task, and nobody else in the crew can ${step}. It will not move without a person.`,
+                suggested: { action: "ack" as const, label: "Take it over yourself, or send a worker back with reassign" },
+              }
+            : fromAlert()) ??
         (prev
           ? {
               rule: "ESCALATE_SITUATION_CHANGED" as const,
@@ -395,7 +429,7 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
 // ---------- Arien ----------
 
 export const arienDispatcher: Dispatcher = (ctx) => {
-  const decisions: DispatchDecision[] = escalations(ctx);
+  const decisions: DispatchDecision[] = [];
 
   const busyOn = new Map<string, string>();
   for (const task of ctx.tasks) if (task.workerId) busyOn.set(task.workerId, task.id);
@@ -452,7 +486,9 @@ export const arienDispatcher: Dispatcher = (ctx) => {
     remaining.splice(remaining.indexOf(pick), 1);
   }
 
-  return decisions;
+  // Escalations come last, so a task that just got a worker is not raised as stuck.
+  const assignedNow = new Set(decisions.flatMap((d) => (d.kind === "assign" ? [d.taskId] : [])));
+  return [...decisions, ...escalations(ctx, assignedNow)];
 };
 
 // ---------- 7. naive baseline ----------

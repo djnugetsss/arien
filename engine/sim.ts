@@ -156,7 +156,7 @@ const taskIndexes = new WeakMap<Sim, Map<string, number>>();
 
 function taskIndexMap(sim: Sim): Map<string, number> {
   let index = taskIndexes.get(sim);
-  if (!index) taskIndexes.set(sim, (index = new Map()));
+  if (!index || index.size > sim.tasks.length) taskIndexes.set(sim, (index = new Map()));
   for (let i = index.size; i < sim.tasks.length; i++) index.set(sim.tasks[i].id, i);
   return index;
 }
@@ -439,7 +439,8 @@ export function stepSim(sim: Sim): SimEvent[] {
   for (const task of sim.tasks) {
     const h = task.handoff;
     if (!isWaiting(task) || !h || h.timedOut || tick <= h.deadlineTick) continue;
-    patchTask(sim, task.id, { handoff: { ...h, timedOut: true }, alert: task.alert ?? "timed_out" });
+    // A failed retry is the more serious alert and stays. Anything else gives way to the timeout.
+    patchTask(sim, task.id, { handoff: { ...h, timedOut: true }, alert: task.alert === "retry_failed" ? task.alert : "timed_out" });
     sim.events.push({ tick, kind: "handoff_failed", taskId: task.id, handoff: h.kind, reason: "timed_out", workerId: null });
     const limitMin = Math.round(sim.coord.acceptWithinS[task.severity] / 60);
     logWhy(sim, { kind: "handoff", rule: "HANDOFF_TIMED_OUT", taskId: task.id, why: `Nobody accepted the ${stepOf(task)} handoff within ${limitMin} min, the limit for severity ${task.severity}.` });

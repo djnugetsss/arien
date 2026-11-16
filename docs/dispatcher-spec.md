@@ -243,6 +243,20 @@ Two things I left out on purpose, for later: paid overtime to finish a job at sh
    - The suggestion for a plain timeout is now "keep it queued, reminder in 8 h", which needs no snooze. "Wait for the shift" is still suggested when everyone is off shift.
    - New rules: `ESCALATE_SITUATION_CHANGED` and `REMIND_STILL_WAITING`.
 
+10. **Review fixes (Nov 15).**
+    - **Nobody left who can do the step** is its own blocker and escalates at once (`ESCALATE_NOBODY_LEFT`). Before, a fault the robot could not confirm, in a crew with no person, waited out its deadline and then got a generic "keep it queued".
+    - **Shift fit is counted in whole ticks.** Counted in raw seconds, a job whose work time was not a whole number of ticks could be started and then cut off one tick after the shift ended.
+    - **"Still waiting" escalations are dropped for a task that gets its worker on the same tick.** A failed retry or a cut-off repair is still raised.
+    - **A timeout is never hidden behind a leftover shift-cut alert.**
+    - **Straight-line distance uses `sqrt`, not `Math.hypot`,** and a guardrail test bans Math functions that can differ between JS engines.
+
+Open questions from the review, not yet decided:
+
+- **Battery model for the baseline.** Over 5 seeds x 3 days with three technicians, the naive baseline strands its drone 18 times and the drone is out of action about 37% of the time. Real drones fly home by themselves on low battery, so a practitioner may read that gap as rigged. Proposal: make low-battery return-to-home part of the physics for both dispatchers and drop the "wait for full charge" special case.
+- **Section 5 is only partly built.** Options carry labels but no predicted result, and Arien never suggests "send X" as the action to approve.
+- **Open escalations do not close when the task moves on.** They stay in the inbox until answered.
+- **The technician guard ignores severity.** A severity-5 fault waiting for a busy robot is not verified by a free technician if any repair that fits is waiting.
+
 Known and left for phase 4:
 
 - **The inbox is still busy when the crew is overloaded.** One technician and about 39 faults a day means many tasks are genuinely stuck. They are now each raised once per step, not repeatedly.

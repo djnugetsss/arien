@@ -83,6 +83,7 @@ export const RULES = [
   "ESCALATE_NO_WORKER_ON_SHIFT",
   "ESCALATE_RETRY_FAILED",
   "ESCALATE_NO_SKILL_IN_CREW",
+  "ESCALATE_NOBODY_LEFT", // everyone with the skill has already failed this step on this task
   "ESCALATE_SHIFT_CUT_REPAIR",
   "ESCALATE_SITUATION_CHANGED", // already raised, then severity, failures, or the blocker got worse
   "REMIND_STILL_WAITING", // already raised, nothing changed, a long time has passed
@@ -102,12 +103,13 @@ export type Rule = (typeof RULES)[number];
  * task that was already raised is stuck in a new way. Only a worse blocker counts as new:
  * a shift starting (off_shift -> capacity) is good news and raises nothing.
  */
-export type Blocker = "capacity" | "off_shift" | "no_skill";
+export type Blocker = "capacity" | "off_shift" | "nobody_left" | "no_skill";
 
 export const BLOCKER_RANK: Record<Blocker, number> = {
   capacity: 0, // workers who could do it exist and are on shift, but are busy or low on battery or shift time
   off_shift: 1, // every worker who could do it is off shift
-  no_skill: 2, // nobody in the crew can do it at all
+  nobody_left: 2, // every worker with the skill has already failed this step on this task
+  no_skill: 3, // nobody in the crew has the skill at all
 };
 
 // ---------- why log ----------

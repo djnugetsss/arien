@@ -175,7 +175,8 @@ export function samePoint(a: Point, b: Point): boolean {
 export function travelDistance(travel: TravelMode, from: Point, to: Point): number {
   const dx = Math.abs(to.x - from.x);
   const dy = Math.abs(to.y - from.y);
-  return travel === "air" ? Math.hypot(dx, dy) : dx + dy;
+  // sqrt, not Math.hypot: sqrt gives the same bits in every JS engine, hypot is allowed to differ.
+  return travel === "air" ? Math.sqrt(dx * dx + dy * dy) : dx + dy;
 }
 
 export function travelSeconds(worker: Worker, to: Point, from: Point = worker.position): number {
