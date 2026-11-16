@@ -12,3 +12,5 @@ export * from "./tasks";
 export * from "./decisions";
 export * from "./dispatcher";
 export * from "./sim";
+export * from "./metrics";
+export * from "./compare";

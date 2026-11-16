@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "typecheck": "next typegen && tsc --noEmit",
     "faults": "tsx scripts/fault-log.ts",
-    "sim": "tsx scripts/sim.ts"
+    "sim": "tsx scripts/sim.ts",
+    "compare": "tsx scripts/compare.ts"
   },
   "dependencies": {
     "next": "16.4.6",
