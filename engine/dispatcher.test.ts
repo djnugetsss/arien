@@ -2,11 +2,11 @@
 // case, escalation, the why log, and the naive baseline.
 import { describe, expect, it } from "vitest";
 import { advance, createClock } from "./clock";
-import { DEFAULT_COORDINATION_CONFIG, RULES, formatDecision, type Dispatcher, type WhyRecord } from "./decisions";
+import { DEFAULT_COORDINATION_CONFIG, RULES, formatDecision, type DispatchDecision, type Dispatcher, type WhyRecord } from "./decisions";
 import { arienDispatcher, naiveDispatcher, scoreTask } from "./dispatcher";
 import type { Fault, FaultType, Severity } from "./faults";
 import { applyHumanAction, createSim, injectFault, runSim, stepSim, type Sim, type SimEvent, type SimOptions } from "./sim";
-import { DEFAULT_TASK_CONFIG, createTask, type FaultOutcomes, type Task } from "./tasks";
+import { DEFAULT_TASK_CONFIG, createTask, type EscalatedState, type FaultOutcomes, type Task } from "./tasks";
 import { createDrone, createGroundRobot, createTechnician, type Worker } from "./workers";
 
 // ---------- helpers ----------
@@ -713,6 +713,217 @@ describe("escalation", () => {
       return JSON.stringify([sim.decisions, sim.events, sim.tasks, sim.workers, sim.escalations]);
     };
     expect(play()).toBe(play());
+  });
+});
+
+// ---------- 5b. escalation noise ----------
+// One escalation per stuck task. Raised again only when its situation changes (severity,
+// another failure, a worse blocker) or after a long time with no change. A snooze ending
+// raises nothing, and a handoff only ever times out once.
+
+describe("escalation noise: when a stuck task is raised again", () => {
+  const coord = DEFAULT_COORDINATION_CONFIG;
+  const REMINDER_TICKS = coord.reminderAfterS / 10;
+  const at = (hour: number) => advance(createClock(), Math.round(hour * TICKS_PER_HOUR));
+  const dayShift = () => [createDrone("D1"), createGroundRobot("G1"), createTechnician("T1")];
+  const alwaysOn = () => [createDrone("D1"), createGroundRobot("G1"), createTechnician("T1", { shift: null })];
+
+  const repair = (id: string, severity: Severity, extra: Partial<Task> = {}): Task => ({
+    ...createTask({ id: `F${id}`, type: "hotspot", severity, startTick: 0, location: { row: 2, colStart: 2, colEnd: 2, x: 2.2, y: 12 } }),
+    state: "repair",
+    ...extra,
+  });
+  /** What the task looked like when it was last raised: a few minutes before 10:00 by default. */
+  const was = (extra: Partial<EscalatedState> = {}): EscalatedState => ({ step: "repair", severity: 3, disruptions: 0, blockerRank: 0, tick: 9.9 * TICKS_PER_HOUR, ...extra });
+
+  const raised = (clock: ReturnType<typeof at>, tasks: Task[], workers = dayShift()) =>
+    arienDispatcher({ clock, tasks, workers, busy: new Set(), coord, taskConfig: DEFAULT_TASK_CONFIG }).filter(
+      (d): d is Extract<DispatchDecision, { kind: "escalate" }> => d.kind === "escalate" && d.level !== "notice",
+    );
+
+  it("raises a stuck task the first time", () => {
+    const [d] = raised(at(10), [repair("0001", 3, { alert: "timed_out" })]);
+    expect(d).toMatchObject({ rule: "ESCALATE_HANDOFF_TIMEOUT", taskIds: ["T0001"], blocker: "capacity" });
+  });
+
+  it("raises nothing for a task that never had trouble", () => {
+    expect(raised(at(10), [repair("0001", 3)])).toEqual([]);
+  });
+
+  it("raises nothing while its escalation is still open", () => {
+    expect(raised(at(10), [repair("0001", 3, { alert: "timed_out", escalationId: "E0001", escalated: was() })])).toEqual([]);
+  });
+
+  it("the same stuck situation is not raised again, even though the alert is still set", () => {
+    expect(raised(at(10), [repair("0001", 3, { alert: "timed_out", escalated: was() })])).toEqual([]);
+    expect(raised(at(10), [repair("0001", 3, { escalated: was() })])).toEqual([]);
+  });
+
+  it("raises again when the severity changes", () => {
+    const [d] = raised(at(10), [repair("0001", 4, { escalated: was({ severity: 3 }) })]);
+    expect(d.rule).toBe("ESCALATE_SITUATION_CHANGED");
+    expect(d.why).toBe("Already raised for repair, and since then: severity changed from 3 to 4.");
+    expect(d.headline).toBe("Sev 4 hotspot at R03-P03: severity changed from 3 to 4");
+  });
+
+  it("raises again after another failure on the same step", () => {
+    const [d] = raised(at(10), [repair("0001", 3, { disruptions: 2, escalated: was({ disruptions: 1 }) })]);
+    expect(d.rule).toBe("ESCALATE_SITUATION_CHANGED");
+    expect(d.why).toContain("1 more failed handoff on this step");
+  });
+
+  it("raises again when the blocker gets worse: every worker who can take it goes off shift", () => {
+    const [d] = raised(at(17), [repair("0001", 3, { escalated: was({ blockerRank: 0 }) })]);
+    expect(d).toMatchObject({ rule: "ESCALATE_SITUATION_CHANGED", blocker: "off_shift" });
+    expect(d.why).toContain("every worker who can repair is now off shift");
+    expect(d.suggested).toMatchObject({ action: "wait", label: "Wait for T1, shift starts 08:00" });
+  });
+
+  it("tasks that all became blocked the same way share one escalation", () => {
+    const tasks = ["0001", "0002", "0003"].map((id) => repair(id, 3, { escalated: was() }));
+    const out = raised(at(17), tasks);
+    expect(out).toHaveLength(1);
+    expect(out[0].taskIds).toEqual(["T0001", "T0002", "T0003"]);
+    expect(out[0].headline).toMatch(/^3 tasks changed:/);
+  });
+
+  it("a better blocker raises nothing: a shift starting is good news", () => {
+    // Last raised overnight (nobody on shift). Now it is 08:00 and the technician is back.
+    expect(raised(at(8), [repair("0001", 3, { alert: "timed_out", escalated: was({ blockerRank: 1 }) })])).toEqual([]);
+    expect(raised(at(10), [repair("0001", 3, { escalated: was({ blockerRank: 1 }) })])).toEqual([]);
+  });
+
+  it("a new step is a new situation: a timeout there is raised even though the last step was", () => {
+    const task = repair("0001", 3, { alert: "timed_out", escalated: was({ step: "verify" }) });
+    expect(raised(at(10), [task])).toMatchObject([{ rule: "ESCALATE_HANDOFF_TIMEOUT" }]);
+  });
+
+  it("a new step alone, with nothing wrong, raises nothing", () => {
+    expect(raised(at(10), [repair("0001", 3, { escalated: was({ step: "verify" }) })])).toEqual([]);
+  });
+
+  describe("reminders", () => {
+    const t0 = 1000;
+    const stuck = (extra: Partial<Task> = {}) => repair("0001", 3, { escalated: was({ tick: t0 }), ...extra });
+    const clockAt = (tick: number) => advance(createClock(), tick);
+
+    it("come one reminder interval after the last escalation, and not a tick before", () => {
+      expect(raised(clockAt(t0 + REMINDER_TICKS - 1), [stuck()], alwaysOn())).toEqual([]);
+      const [d] = raised(clockAt(t0 + REMINDER_TICKS), [stuck()], alwaysOn());
+      expect(d).toMatchObject({ rule: "REMIND_STILL_WAITING", taskIds: ["T0001"] });
+      expect(d.why).toBe("No change in the 8 h since this task was last raised. Still waiting for repair.");
+    });
+
+    it("count from the end of a snooze, so the snooze ending raises nothing itself", () => {
+      const snoozed = stuck({ snoozeUntilTick: t0 + 2000 });
+      expect(raised(clockAt(t0 + 2000), [snoozed], alwaysOn())).toEqual([]); // the snooze ends: nothing
+      expect(raised(clockAt(t0 + REMINDER_TICKS), [snoozed], alwaysOn())).toEqual([]); // would be due without the snooze
+      expect(raised(clockAt(t0 + 2000 + REMINDER_TICKS - 1), [snoozed], alwaysOn())).toEqual([]);
+      expect(raised(clockAt(t0 + 2000 + REMINDER_TICKS), [snoozed], alwaysOn())).toMatchObject([{ rule: "REMIND_STILL_WAITING" }]);
+    });
+
+    it("tasks reminded at the same time share one escalation", () => {
+      const out = raised(clockAt(t0 + REMINDER_TICKS), [stuck(), repair("0002", 3, { escalated: was({ tick: t0 }) })], alwaysOn());
+      expect(out).toHaveLength(1);
+      expect(out[0].taskIds).toEqual(["T0001", "T0002"]);
+      expect(out[0].headline).toBe("2 tasks are still waiting for repair, nothing has changed");
+    });
+
+    it("a task that is no longer waiting gets no reminder", () => {
+      expect(raised(clockAt(t0 + REMINDER_TICKS), [stuck({ workerId: "T1", phase: "working" })], alwaysOn())).toEqual([]);
+    });
+  });
+});
+
+describe("escalation noise: whole sim", () => {
+  const SLOW_INSPECT = { workSeconds: { ...DEFAULT_TASK_CONFIG.workSeconds, inspect: { ...DEFAULT_TASK_CONFIG.workSeconds.inspect, hotspot: 30 * 3600 } } };
+  const escalationsFor = (sim: Sim, id: string) => sim.escalations.filter((e) => e.taskIds.includes(id) && e.level !== "notice");
+
+  it("a snooze ending does not start a new escalation, and the handoff does not time out again", () => {
+    const sim = quietSim(1, { autoHuman: false });
+    const id = place(sim, { severity: 4 }, { needsReplace: false }); // 30 min to accept, nobody on shift until 08:00
+    until(sim, () => escalationsFor(sim, id).length > 0);
+    const snoozeEnd = 3 * TICKS_PER_HOUR;
+    applyHumanAction(sim, { escalationId: escalationsFor(sim, id)[0].id, action: "wait", untilTick: snoozeEnd });
+    run(sim, 7 * TICKS_PER_HOUR - sim.clock.tick); // past the snooze end and several accept windows, before the shift
+    expect(sim.clock.tick).toBe(7 * TICKS_PER_HOUR);
+    expect(task(sim, id).snoozeUntilTick).toBe(snoozeEnd);
+    expect(escalationsFor(sim, id)).toHaveLength(1);
+    expect(events(sim, "handoff_failed", id).filter((e) => e.reason === "timed_out")).toHaveLength(1);
+    expect(whys(sim, id).filter((d) => d.rule === "HANDOFF_TIMED_OUT")).toHaveLength(1);
+    // The technician takes it at shift start, still with one escalation in total.
+    until(sim, () => task(sim, id).workerId === "T1");
+    expect(escalationsFor(sim, id)).toHaveLength(1);
+  });
+
+  it("a snooze never touches the handoff's deadline or its timed-out flag", () => {
+    const sim = quietSim(1, { autoHuman: false });
+    const id = place(sim, { severity: 4 }, { needsReplace: false });
+    until(sim, () => escalationsFor(sim, id).length > 0);
+    const before = task(sim, id).handoff!;
+    applyHumanAction(sim, { escalationId: escalationsFor(sim, id)[0].id, action: "wait", untilTick: 5 * TICKS_PER_HOUR });
+    expect(task(sim, id).handoff).toEqual(before);
+    expect(before.timedOut).toBe(true);
+  });
+
+  it("a long unchanged wait gets one reminder per interval, and one timeout in total", () => {
+    // D1 is busy for 30 hours, so the second fault waits for a drone that never comes free.
+    const bigDrone = createDrone("D1", { battery: { capacityS: 40 * 3600, rechargeS: 3600 } });
+    const sim = quietSim(10, { crew: [bigDrone, createGroundRobot("G1"), createTechnician("T1")], taskConfig: SLOW_INSPECT });
+    place(sim, { severity: 5 });
+    run(sim, 1);
+    const second = place(sim, { severity: 5, row: 9 });
+    run(sim, 17 * TICKS_PER_HOUR);
+    const list = escalationsFor(sim, second);
+    expect(list.map((e) => e.rule)).toEqual(["ESCALATE_HANDOFF_TIMEOUT", "REMIND_STILL_WAITING", "REMIND_STILL_WAITING"]);
+    expect(list[1].openedTick - list[0].openedTick).toBe(8 * TICKS_PER_HOUR);
+    expect(list[2].openedTick - list[1].openedTick).toBe(8 * TICKS_PER_HOUR);
+    expect(list[1].why).toContain("No change in the 8 h");
+    expect(events(sim, "handoff_failed", second).filter((e) => e.reason === "timed_out")).toHaveLength(1);
+  });
+
+  it("every escalation after the first for a task is a change or a reminder, never a repeat (2 days, both dispatchers)", () => {
+    for (const dispatcher of [arienDispatcher, naiveDispatcher]) {
+      for (const seed of [1, "arien-demo"]) {
+        const sim = createSim({ seed, dispatcher });
+        const last = new Map<string, { key: string; tick: number }>();
+        for (let i = 0; i < 2 * 8640; i++) {
+          stepSim(sim);
+          for (const t of sim.tasks) {
+            if (!t.escalated || t.escalated.tick !== sim.clock.tick) continue;
+            const d = sim.decisions.findLast((x) => x.taskId === t.id && x.kind === "escalate" && x.tick === sim.clock.tick)!;
+            const key = `${t.escalated.step}|${t.escalated.severity}|${t.escalated.disruptions}|${t.escalated.blockerRank}`;
+            const prev = last.get(t.id);
+            if (prev && d.rule === "REMIND_STILL_WAITING") expect(sim.clock.tick - prev.tick).toBeGreaterThanOrEqual(8 * TICKS_PER_HOUR);
+            else if (prev && d.rule !== "ESCALATE_STRANDED") expect(key, `${t.id} raised twice for ${key} (${d.rule})`).not.toBe(prev.key);
+            last.set(t.id, { key, tick: sim.clock.tick });
+          }
+        }
+      }
+    }
+  });
+
+  it("a handoff times out at most once between being offered and being accepted (2 days, both dispatchers)", () => {
+    for (const dispatcher of [arienDispatcher, naiveDispatcher]) {
+      const sim = runSim({ seed: "arien-demo", ticks: 2 * 8640, dispatcher });
+      const open = new Map<string, boolean>(); // task -> already timed out since the last offer
+      for (const e of sim.events) {
+        if (e.kind === "handoff_offered") open.set(e.taskId, false);
+        if (e.kind === "handoff_accepted") open.set(e.taskId, false);
+        if (e.kind === "handoff_failed" && e.reason === "timed_out") {
+          expect(open.get(e.taskId), `${e.taskId} timed out twice without a new offer`).toBe(false);
+          open.set(e.taskId, true);
+        }
+      }
+    }
+  });
+
+  it("tasks blocked the same way at the same moment share one escalation (shift end in the default run)", () => {
+    const sim = runSim({ seed: "arien-demo", ticks: 8640 });
+    const changed = sim.escalations.filter((e) => e.rule === "ESCALATE_SITUATION_CHANGED");
+    expect(changed.length).toBeGreaterThan(0);
+    expect(new Set(changed.map((e) => e.openedTick)).size).toBe(changed.length); // never two at the same tick
+    expect(Math.max(...changed.map((e) => e.taskIds.length))).toBeGreaterThan(3);
   });
 });
 

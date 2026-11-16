@@ -6,7 +6,9 @@
 
 import { formatTimeOfDay, type Clock } from "./clock";
 import {
+  BLOCKER_RANK,
   formatScore,
+  type Blocker,
   type Candidate,
   type DispatchContext,
   type DispatchDecision,
@@ -15,6 +17,7 @@ import {
   type Rule,
   type Score,
   type CoordinationConfig,
+  type SuggestedAction,
 } from "./decisions";
 import { formatLocation } from "./faults";
 import { isWaiting, skillFor, stepOf, workSecondsFor, type Task } from "./tasks";
@@ -201,10 +204,35 @@ function holdDecision({ task, score }: Scored, all: Evaluated[]): DispatchDecisi
 }
 
 // ---------- 5. escalation triggers ----------
+//
+// One escalation per stuck task. A task that was already raised is raised again only when:
+//   - its severity changed,
+//   - it suffered another failure (dropped, late, bounced, or cut off),
+//   - its blocker got worse (for example every worker who could take it went off shift), or
+//   - a long time (reminderAfterS) passed with nothing changing.
+// A snooze ending is not on that list, and neither is a handoff deadline: a handoff times
+// out once, and the sim never resets that clock.
 
 function describe(task: Task): string {
   const where = task.fault ? ` at ${formatLocation(task.fault.location)}` : "";
   return task.kind === "fault" ? `Sev ${task.severity} ${task.label}${where}` : `Job to ${task.label}`;
+}
+
+/** How the task is blocked right now. */
+export function blockerOf(task: Task, ctx: DispatchContext): Blocker {
+  const skill = skillFor(task);
+  if (!skill || !ctx.workers.some((w) => hasSkill(w, skill))) return "no_skill";
+  const capable = ctx.workers.filter((w) => hasSkill(w, skill) && !task.failedWorkerIds.includes(w.id));
+  return capable.length > 0 && capable.every((w) => !isOnShift(w.shift, ctx.clock)) ? "off_shift" : "capacity";
+}
+
+interface Raise {
+  rule: Rule;
+  headline: (n: number) => string;
+  why: string;
+  suggested: SuggestedAction;
+  /** Tasks stuck for the same reason at the same time share one escalation. */
+  digestKey?: string;
 }
 
 function escalations(ctx: DispatchContext): DispatchDecision[] {
@@ -213,6 +241,8 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
   const out: DispatchDecision[] = [];
   const digests = new Map<string, Extract<DispatchDecision, { kind: "escalate" }>>();
   const ticksFor = (seconds: number) => Math.ceil(seconds / clock.tickSeconds);
+  const reminderHours = Math.round(coord.reminderAfterS / 3600);
+  const keepQueued: SuggestedAction = { action: "ack", label: `Keep it queued. You'll be reminded in ${reminderHours} h if nothing changes` };
 
   for (const task of ctx.tasks) {
     // A new severity-5 fault: tell the human, nothing to decide.
@@ -225,85 +255,139 @@ function escalations(ctx: DispatchContext): DispatchDecision[] {
         headline: `${describe(task)} just appeared`,
         why: "New severity-5 fault. For your information, no action needed.",
         suggested: { action: "ack", label: "Nothing to do" },
+        blocker: "capacity",
       });
     }
 
-    if (!isWaiting(task) || task.escalationId !== null || tick < task.snoozeUntilTick) continue;
-    const skill = skillFor(task)!;
-    const step = stepOf(task)!;
-    const waitedMin = minutes((tick - task.createdTick) * clock.tickSeconds);
-    const capable = ctx.workers.filter((w) => hasSkill(w, skill) && !task.failedWorkerIds.includes(w.id));
-    const windowTicks = ticksFor(coord.acceptWithinS[task.severity]);
+    // One open escalation per task: while it sits in the inbox there is nothing to add.
+    if (!isWaiting(task) || task.escalationId !== null) continue;
 
-    // Earliest tick a capable worker could plausibly take it: next shift start, or one more window.
-    const offShift = capable.length > 0 && capable.every((w) => !isOnShift(w.shift, clock));
+    const step = stepOf(task)!;
+    const skill = skillFor(task)!;
+    const blocker = blockerOf(task, ctx);
+    const rank = BLOCKER_RANK[blocker];
+    const waitedMin = minutes((tick - task.createdTick) * clock.tickSeconds);
+
+    // What was raised last time for this step, and what has changed since.
+    const prev = task.escalated && task.escalated.step === step ? task.escalated : null;
+    const changes: string[] = [];
+    if (prev) {
+      if (task.severity !== prev.severity) changes.push(`severity changed from ${prev.severity} to ${task.severity}`);
+      if (task.disruptions > prev.disruptions) {
+        const n = task.disruptions - prev.disruptions;
+        changes.push(`${n} more failed handoff${n === 1 ? "" : "s"} on this step`);
+      }
+      if (rank > prev.blockerRank) {
+        changes.push(blocker === "off_shift" ? `every worker who can ${step} is now off shift` : `nobody in the crew can ${step}`);
+      }
+    }
+    const isNew = prev === null || changes.length > 0;
+
+    // Suggested answers.
+    const capable = ctx.workers.filter((w) => hasSkill(w, skill) && !task.failedWorkerIds.includes(w.id));
     const nextShiftTick = tick + Math.min(...capable.map((w) => ticksFor(secondsUntilShiftStart(w.shift, clock))), Infinity);
     const firstBack = capable.reduce<Worker | null>(
       (best, w) => (!best || secondsUntilShiftStart(w.shift, clock) < secondsUntilShiftStart(best.shift, clock) ? w : best),
       null,
     );
-    const waitForShift = { action: "wait" as const, untilTick: nextShiftTick, label: `Wait for ${firstBack?.id}, shift starts ${formatTimeOfDay(clock, nextShiftTick)}` };
-    const waitAWhile = { action: "wait" as const, untilTick: tick + windowTicks, label: `Keep it queued and check again at ${formatTimeOfDay(clock, tick + windowTicks)}` };
+    const waitForShift: SuggestedAction = {
+      action: "wait",
+      untilTick: nextShiftTick,
+      label: `Wait for ${firstBack?.id}, shift starts ${formatTimeOfDay(clock, nextShiftTick)}`,
+    };
+    const offShift = blocker === "off_shift";
 
-    const digest = (key: string, rule: Rule, headline: (n: number) => string, why: string, suggested: typeof waitAWhile) => {
-      const existing = digests.get(key);
-      if (existing) {
-        existing.taskIds.push(task.id);
-        existing.headline = headline(existing.taskIds.length);
-        return;
+    const fromAlert = (): Raise | null => {
+      switch (task.alert) {
+        case "retry_failed":
+          return {
+            rule: "ESCALATE_RETRY_FAILED",
+            headline: () => `${describe(task)}: handoff for ${step} failed twice`,
+            why: `The first worker and the retry both failed to take over ${step}.`,
+            suggested: offShift ? waitForShift : keepQueued,
+          };
+        case "timed_out":
+          return offShift
+            ? {
+                rule: "ESCALATE_NO_WORKER_ON_SHIFT",
+                digestKey: `no_shift:${skill}`,
+                headline: (n) => (n === 1 ? `${describe(task)} has waited ${waitedMin} min for ${step}, nobody is on shift` : `${n} tasks are past their deadline waiting for ${skill}, nobody is on shift`),
+                why: `Past the response deadline for ${step}, and every worker who can ${step} is off shift.`,
+                suggested: waitForShift,
+              }
+            : {
+                rule: "ESCALATE_HANDOFF_TIMEOUT",
+                digestKey: `timeout:${skill}`,
+                headline: (n) => (n === 1 ? `${describe(task)} has waited ${waitedMin} min for ${step}` : `${n} tasks are past their deadline waiting for ${skill}`),
+                why: `Nobody accepted the ${step} handoff within ${minutes(coord.acceptWithinS[task.severity])} min (the limit for severity ${task.severity}).`,
+                suggested: keepQueued,
+              };
+        case "shift_cut":
+          if (task.severity < coord.shiftCutEscalateSeverity) return null;
+          return {
+            rule: "ESCALATE_SHIFT_CUT_REPAIR",
+            headline: () => `${describe(task)}: ${step} was cut off when the shift ended`,
+            why: `A severity ${task.severity} ${step} was dropped at shift end and its progress was lost.`,
+            suggested: offShift ? waitForShift : keepQueued,
+          };
+        default:
+          return null;
       }
-      const decision = { kind: "escalate" as const, rule, level: "needs_decision" as const, taskIds: [task.id], headline: headline(1), why, suggested, digestKey: key };
-      digests.set(key, decision);
-      out.push(decision);
     };
 
-    if (!ctx.workers.some((w) => hasSkill(w, skill))) {
-      out.push({
-        kind: "escalate",
-        rule: "ESCALATE_NO_SKILL_IN_CREW",
-        level: "needs_decision",
-        taskIds: [task.id],
-        headline: `${describe(task)} needs ${step}, and nobody in the crew can do that`,
-        why: `No worker in the crew has the ${skill} skill.`,
-        suggested: { action: "wait", untilTick: tick + ticksFor(24 * 3600), label: "Leave it queued for a day (take over to handle it yourself)" },
-      });
-    } else if (task.alert === "retry_failed") {
-      out.push({
-        kind: "escalate",
-        rule: "ESCALATE_RETRY_FAILED",
-        level: "needs_decision",
-        taskIds: [task.id],
-        headline: `${describe(task)}: handoff for ${step} failed twice`,
-        why: `The first worker and the retry both failed to take over ${step}.`,
-        suggested: offShift ? waitForShift : waitAWhile,
-      });
-    } else if (task.alert === "timed_out" && offShift) {
-      digest(
-        `no_shift:${skill}`,
-        "ESCALATE_NO_WORKER_ON_SHIFT",
-        (n) => (n === 1 ? `${describe(task)} has waited ${waitedMin} min for ${step}, nobody is on shift` : `${n} tasks are past their deadline waiting for ${skill}, nobody is on shift`),
-        `Past the response deadline for ${step}, and every worker who can ${step} is off shift.`,
-        waitForShift,
-      );
-    } else if (task.alert === "timed_out") {
-      digest(
-        `timeout:${skill}`,
-        "ESCALATE_HANDOFF_TIMEOUT",
-        (n) => (n === 1 ? `${describe(task)} has waited ${waitedMin} min for ${step}` : `${n} tasks are past their deadline waiting for ${skill}`),
-        `Nobody accepted the ${step} handoff within ${minutes(coord.acceptWithinS[task.severity])} min (the limit for severity ${task.severity}).`,
-        waitAWhile,
-      );
-    } else if (task.alert === "shift_cut" && task.severity >= coord.shiftCutEscalateSeverity) {
-      out.push({
-        kind: "escalate",
-        rule: "ESCALATE_SHIFT_CUT_REPAIR",
-        level: "needs_decision",
-        taskIds: [task.id],
-        headline: `${describe(task)}: ${step} was cut off when the shift ended`,
-        why: `A severity ${task.severity} ${step} was dropped at shift end and its progress was lost.`,
-        suggested: offShift ? waitForShift : waitAWhile,
-      });
+    let raise: Raise | null = null;
+    if (isNew) {
+      raise =
+        (blocker === "no_skill"
+          ? {
+              rule: "ESCALATE_NO_SKILL_IN_CREW" as const,
+              headline: () => `${describe(task)} needs ${step}, and nobody in the crew can do that`,
+              why: `No worker in the crew has the ${skill} skill.`,
+              suggested: { action: "ack" as const, label: "Take it over yourself, or add a worker with this skill" },
+            }
+          : fromAlert()) ??
+        (prev
+          ? {
+              rule: "ESCALATE_SITUATION_CHANGED" as const,
+              // Tasks that all just became blocked the same way (a shift ended) share one escalation.
+              digestKey: changes.length === 1 && rank > prev.blockerRank ? `changed:${blocker}` : undefined,
+              headline: (n: number) => (n === 1 ? `${describe(task)}: ${changes[0]}` : `${n} tasks changed: ${changes[0].replace(/^every worker who can \w+/, "every worker who can take them")}`),
+              why: `Already raised for ${step}, and since then: ${changes.join("; ")}.`,
+              suggested: offShift ? waitForShift : keepQueued,
+            }
+          : null);
+    } else if (prev && tick >= Math.max(prev.tick, task.snoozeUntilTick) + ticksFor(coord.reminderAfterS)) {
+      // Nothing changed for a long time. Counted from the last escalation, or from the end of a snooze.
+      raise = {
+        rule: "REMIND_STILL_WAITING",
+        digestKey: `remind:${skill}`,
+        headline: (n) => (n === 1 ? `Still waiting: ${describe(task)} needs ${step}, ${waitedMin} min since detection` : `${n} tasks are still waiting for ${skill}, nothing has changed`),
+        why: `No change in the ${reminderHours} h since this task was last raised. Still waiting for ${step}.`,
+        suggested: offShift ? waitForShift : keepQueued,
+      };
     }
+    if (!raise) continue;
+
+    const level = "needs_decision" as const;
+    const existing = raise.digestKey ? digests.get(raise.digestKey) : undefined;
+    if (existing) {
+      existing.taskIds.push(task.id);
+      existing.headline = raise.headline(existing.taskIds.length);
+      continue;
+    }
+    const decision = {
+      kind: "escalate" as const,
+      rule: raise.rule,
+      level,
+      taskIds: [task.id],
+      headline: raise.headline(1),
+      why: raise.why,
+      suggested: raise.suggested,
+      blocker,
+      digestKey: raise.digestKey,
+    };
+    if (raise.digestKey) digests.set(raise.digestKey, decision);
+    out.push(decision);
   }
   return out;
 }

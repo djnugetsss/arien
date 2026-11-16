@@ -28,6 +28,11 @@ export interface CoordinationConfig {
   batteryReserve: number;
   /** A repair cut off by shift end escalates at this severity or above. */
   shiftCutEscalateSeverity: Severity;
+  /**
+   * A task that stays stuck with nothing changing is raised again this many seconds after
+   * it was last raised (or after a snooze ended). The only reason to raise it again.
+   */
+  reminderAfterS: number;
 }
 
 const MIN = 60;
@@ -45,6 +50,7 @@ export const DEFAULT_COORDINATION_CONFIG: CoordinationConfig = {
   nearTiePoints: 10, // ASSUMPTION
   batteryReserve: 0.2, // ASSUMPTION: keep 20% of the battery in reserve
   shiftCutEscalateSeverity: 4, // ASSUMPTION
+  reminderAfterS: 8 * 3600, // ASSUMPTION: remind once per 8-hour shift if a stuck task is still unchanged
 };
 
 // ---------- rules ----------
@@ -78,6 +84,8 @@ export const RULES = [
   "ESCALATE_RETRY_FAILED",
   "ESCALATE_NO_SKILL_IN_CREW",
   "ESCALATE_SHIFT_CUT_REPAIR",
+  "ESCALATE_SITUATION_CHANGED", // already raised, then severity, failures, or the blocker got worse
+  "REMIND_STILL_WAITING", // already raised, nothing changed, a long time has passed
   "NOTICE_SEV5",
   // human
   "HUMAN_APPROVE",
@@ -86,6 +94,21 @@ export const RULES = [
   "OVERRIDE_TAKE_OVER",
 ] as const;
 export type Rule = (typeof RULES)[number];
+
+// ---------- blockers ----------
+
+/**
+ * Why a waiting task cannot start, from least to most serious. Used to decide whether a
+ * task that was already raised is stuck in a new way. Only a worse blocker counts as new:
+ * a shift starting (off_shift -> capacity) is good news and raises nothing.
+ */
+export type Blocker = "capacity" | "off_shift" | "no_skill";
+
+export const BLOCKER_RANK: Record<Blocker, number> = {
+  capacity: 0, // workers who could do it exist and are on shift, but are busy or low on battery or shift time
+  off_shift: 1, // every worker who could do it is off shift
+  no_skill: 2, // nobody in the crew can do it at all
+};
 
 // ---------- why log ----------
 
@@ -165,6 +188,8 @@ export type DispatchDecision =
       headline: string;
       why: string;
       suggested: SuggestedAction;
+      /** How the task is blocked right now. Stored with the escalation so a worse one counts as new. */
+      blocker: Blocker;
       /** Tasks stuck for the same reason share one escalation. */
       digestKey?: string;
     };

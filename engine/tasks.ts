@@ -62,6 +62,22 @@ export interface Handoff {
   timedOut: boolean;
 }
 
+/**
+ * What a task looked like the last time it was escalated. The dispatcher compares the
+ * task now against this, so the same stuck situation is raised once, not again and again.
+ */
+export interface EscalatedState {
+  /** The step the task was on. A new step is a new situation, not a change within one. */
+  step: string;
+  severity: Severity;
+  /** How many failures the task had suffered by then. */
+  disruptions: number;
+  /** How bad the blocker was (see BLOCKER_RANK in decisions.ts). Only a worse one counts as new. */
+  blockerRank: number;
+  /** Tick the escalation was raised. Reminders count from here. */
+  tick: number;
+}
+
 /** Set by the sim when something goes wrong. The dispatcher decides whether to escalate. */
 export type TaskAlert = "timed_out" | "retry_failed" | "shift_cut";
 
@@ -97,7 +113,11 @@ export interface Task {
   alert: TaskAlert | null;
   /** The open escalation covering this task, if any. */
   escalationId: string | null;
-  /** A person said "wait until then". No new escalation before this tick. */
+  /** The last time this task was escalated, kept after the escalation is answered. */
+  escalated: EscalatedState | null;
+  /** Dropped, late, bounced, or cut-off handoffs on this task so far. Never goes down. */
+  disruptions: number;
+  /** A person said "wait until then". Reminders for this task start counting from here. */
   snoozeUntilTick: number;
   /** A person picked this worker. The sim assigns them as soon as they are free. */
   forcedWorkerId: string | null;
@@ -171,6 +191,8 @@ function blankTask(): Omit<Task, "id" | "kind" | "label" | "severity" | "fault" 
     handoff: null,
     alert: null,
     escalationId: null,
+    escalated: null,
+    disruptions: 0,
     snoozeUntilTick: 0,
     forcedWorkerId: null,
     holdKey: null,

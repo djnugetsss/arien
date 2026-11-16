@@ -15,7 +15,9 @@
 
 import { advance, createClock, formatSimTime, type Clock } from "./clock";
 import {
+  BLOCKER_RANK,
   DEFAULT_COORDINATION_CONFIG,
+  type Blocker,
   type CoordinationConfig,
   type DispatchDecision,
   type Dispatcher,
@@ -249,7 +251,17 @@ function assign(sim: Sim, taskId: string, workerId: string, forced: boolean): vo
 
 function openEscalation(
   sim: Sim,
-  spec: { rule: Rule; level: EscalationLevel; taskIds: string[]; workerId?: string; headline: string; why: string; suggested: SuggestedAction; digestKey?: string },
+  spec: {
+    rule: Rule;
+    level: EscalationLevel;
+    taskIds: string[];
+    workerId?: string;
+    headline: string;
+    why: string;
+    suggested: SuggestedAction;
+    blocker?: Blocker;
+    digestKey?: string;
+  },
 ): Escalation {
   const tick = sim.clock.tick;
 
@@ -293,7 +305,12 @@ function openEscalation(
   for (const taskId of spec.taskIds) {
     logWhy(sim, { kind: "escalate", rule: spec.rule, taskId, workerId: spec.workerId, why: `${spec.headline}. ${spec.why} Suggested: ${spec.suggested.label}.` });
     sim.events.push({ tick, kind: "escalated", taskId, escalationId: esc.id, level: spec.level });
-    if (spec.level !== "notice") patchTask(sim, taskId, { escalationId: esc.id, alert: null });
+    if (spec.level !== "notice") {
+      // Remember what the task looked like, so the same situation is not raised again.
+      const t = sim.tasks[taskIndex(sim, taskId)];
+      const escalated = { step: stepOf(t) ?? "done", severity: t.severity, disruptions: t.disruptions, blockerRank: BLOCKER_RANK[spec.blocker ?? "capacity"], tick };
+      patchTask(sim, taskId, { escalationId: esc.id, alert: null, escalated });
+    }
   }
 
   // A notice needs no answer.
@@ -318,10 +335,9 @@ export function applyHumanAction(sim: Sim, action: HumanAction): void {
 
   const snooze = (untilTick: number, rule: Rule, label: string) => {
     for (const taskId of open) {
-      const task = sim.tasks[taskIndex(sim, taskId)];
-      const window = ticksFor(sim, sim.coord.acceptWithinS[task.severity]);
-      const handoff = task.handoff && task.workerId === null ? { ...task.handoff, deadlineTick: untilTick + window, timedOut: false } : task.handoff;
-      patchTask(sim, taskId, { snoozeUntilTick: untilTick, handoff, alert: null });
+      // A snooze only moves the reminder clock. It never touches the handoff: a handoff that
+      // timed out stays timed out, and the end of a snooze raises nothing by itself.
+      patchTask(sim, taskId, { snoozeUntilTick: untilTick });
       logWhy(sim, { kind: "resolve", rule, taskId, why: `${by} answered ${esc.id}: ${label}. No new escalation before ${formatSimTime({ ...sim.clock, tick: untilTick })}.` });
     }
   };
@@ -384,7 +400,7 @@ function failHandoff(sim: Sim, task: Task, reason: Exclude<HandoffFailure, "time
   sim.events.push({ tick, kind: "handoff_failed", taskId: task.id, handoff: handoffKindFor(task), reason, workerId });
 
   const retryFailed = failCount >= 2;
-  const next = patchTask(sim, task.id, { ...patch, workerId: null, phase: "waiting", workLeftS: 0, alert: retryFailed ? "retry_failed" : task.alert });
+  const next = patchTask(sim, task.id, { ...patch, workerId: null, phase: "waiting", workLeftS: 0, disruptions: task.disruptions + 1, alert: retryFailed ? "retry_failed" : task.alert });
   patchTask(sim, task.id, { handoff: offer(sim, next, { failCount }) });
   offerEvent(sim, sim.tasks[taskIndex(sim, task.id)], true);
 
@@ -487,7 +503,7 @@ export function stepSim(sim: Sim): SimEvent[] {
         failHandoff(sim, task, "dropped", worker.id, `${worker.id}'s ${cause} on the way to ${step}.`, { interrupted: true });
       } else {
         const cutRepair = !stranded && (task.state === "repair" || task.state === "replace") && task.kind === "fault";
-        const next = patchTask(sim, task.id, { workerId: null, phase: "waiting", workLeftS: 0, interrupted: true, alert: cutRepair ? "shift_cut" : task.alert });
+        const next = patchTask(sim, task.id, { workerId: null, phase: "waiting", workLeftS: 0, interrupted: true, disruptions: task.disruptions + 1, alert: cutRepair ? "shift_cut" : task.alert });
         patchTask(sim, task.id, { handoff: offer(sim, next, { failCount: task.handoff?.failCount ?? 0 }) });
         offerEvent(sim, sim.tasks[taskIndex(sim, task.id)], true);
         logWhy(sim, {

@@ -232,7 +232,18 @@ Two things I left out on purpose, for later: paid overtime to finish a job at sh
 7. **A `human` flag on workers** marks people. Only a person's verify is always conclusive. The engine still never branches on the worker type label.
 8. **`injectFault()`** places a specific fault by hand. Tests use it now; crew mode will need it.
 
+9. **Escalations are raised once per stuck situation, not once per deadline.** The first build re-raised a task every time a snooze ended, because a snooze reset the handoff deadline and the timeout fired again. Fixed (section 5 now reads as follows):
+   - A task remembers what it looked like when it was last escalated: its step, severity, failure count and blocker.
+   - It is raised again only when **severity changes**, it suffers **another failed handoff**, its **blocker gets worse** (for example every worker who can take it goes off shift), or **8 hours pass with no change** (`reminderAfterS`, `// ASSUMPTION`).
+   - **Blockers only count when they get worse.** capacity (busy, low battery) is the mildest, then nobody on shift, then nobody in the crew has the skill. A shift starting is good news and raises nothing.
+   - A **new step** is a new situation, so a task can be raised once per step it gets stuck on.
+   - **A snooze ending raises nothing.** It only moves the reminder clock: the reminder counts 8 h from the end of the snooze. A snooze never touches the handoff.
+   - **A handoff times out at most once** between being offered and being accepted.
+   - Tasks that got stuck the same way at the same moment (a shift ending, a reminder round) share one escalation.
+   - The suggestion for a plain timeout is now "keep it queued, reminder in 8 h", which needs no snooze. "Wait for the shift" is still suggested when everyone is off shift.
+   - New rules: `ESCALATE_SITUATION_CHANGED` and `REMIND_STILL_WAITING`.
+
 Known and left for phase 4:
 
-- **The inbox is noisy when the crew is overloaded.** With one technician and about 39 faults a day, the default run opens 69 escalations, nearly all "past deadline, still waiting", and each is re-raised after its snooze ends. The rules work as specified; the deadlines or the snooze length probably need tuning once metrics exist.
-- **The stand-in human only ever says "wait" or acknowledges.** It cannot add capacity, so it does not change outcomes. It only keeps the inbox moving.
+- **The inbox is still busy when the crew is overloaded.** One technician and about 39 faults a day means many tasks are genuinely stuck. They are now each raised once per step, not repeatedly.
+- **The stand-in human only ever acknowledges or says "wait".** It cannot add capacity, so it does not change outcomes. It only keeps the inbox moving.
